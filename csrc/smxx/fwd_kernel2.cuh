@@ -190,6 +190,8 @@ _flash_kda_fwd_recurrence(
     CUTE_GRID_CONSTANT TmaStoreState const tma_store_final_state,
     CUTE_GRID_CONSTANT TmaStoreOut const tma_store_out,
     cutlass::bfloat16_t* out_raw_ptr,
+    void const* initial_state_raw,
+    void* final_state_raw,
     void* checkpoint_state_raw,
     SeqlenT const* checkpoint_offsets,
     int T_total,
@@ -348,44 +350,7 @@ _flash_kda_fwd_recurrence(
         }
         __syncthreads();
         cutlass::arch::fence_view_async_shared();
-    } else if constexpr (HasStateIn && StateFP32) {
-        // FP32 state: TMA load fp32 into pipeline buffer, then convert to bf16 in state_acc
-        using FP32StateSmemLayout = typename Layouts::FP32StateSmemLayout;
-        using TMAFP32StateSmemLayout = typename Layouts::TMAFP32StateSmemLayout;
-
-        if (warp_role == WarpRole::LOAD_QKG) {
-            using BarrierType = cutlass::arch::ClusterTransactionBarrier::ValueType;
-            constexpr uint32_t kFP32StateTransactionBytes = cute::cosize_v<StateSmemLayout> * sizeof(float);
-
-            Tensor g_init = tma_load_initial_state.get_tma_tensor(make_shape(N * H, D, D));
-            auto init_off = g_init.layout()(seq_idx * H + head_idx, v_idx * VD, 0);
-            Tensor g_init_tile = make_tensor(g_init.data() + init_off,
-                make_layout(make_shape(Int<1>{}, Int<VD>{}, Int<D>{}), stride(g_init.layout())));
-            Tensor s_fp32 = make_tensor(
-                make_smem_ptr(reinterpret_cast<float*>(shared_storage.state_fp32_buf)),
-                TMAFP32StateSmemLayout{});
-
-            auto cta_tma_load_state = tma_load_initial_state.get_slice(Int<0>{});
-            if (cute::elect_one_sync()) {
-                shared_storage.state_acc_tma_barrier.arrive_and_expect_tx(kFP32StateTransactionBytes);
-                cute::copy(
-                    tma_load_initial_state.with(reinterpret_cast<BarrierType&>(shared_storage.state_acc_tma_barrier)),
-                    cta_tma_load_state.partition_S(g_init_tile),
-                    cta_tma_load_state.partition_D(s_fp32)
-                );
-            }
-            shared_storage.state_acc_tma_barrier.wait(0);
-        }
-        __syncthreads();
-        cutlass::arch::fence_view_async_shared();
-
-        // All threads: convert fp32 -> bf16 with layout transformation
-        smem_cvt_fp32_to_bf16<FP32StateSmemLayout, StateSmemLayout, VD, D, NumThreads>(
-            reinterpret_cast<float*>(shared_storage.state_fp32_buf),
-            shared_storage.state_acc.begin(),
-            threadIdx.x);
-        __syncthreads();
-    } else {
+    } else if constexpr (!StateFP32) {
         // No state in: zero-initialize state_acc
         {
             BF16* buf = shared_storage.state_acc.begin();
@@ -494,7 +459,7 @@ _flash_kda_fwd_recurrence(
             kValueBlocksPerWarp == 1 || kValueBlocksPerWarp == 2);
 
         // Keep this warp's value columns of the recurrent [K,V] state in
-        // BF16 C fragments for the entire chunk loop. Phase 1 transposes each
+        // FP32 C fragments for the entire chunk loop. Phase 1 transposes each
         // fragment into an MMA-B operand with MOVM_T; Phase 6 updates the C
         // fragment in place. Shared memory is touched only at entry and, when
         // requested, once more before the final-state TMA store.
@@ -524,6 +489,16 @@ _flash_kda_fwd_recurrence(
         using ResidentStateAcc = decltype(resident_thr_mma.make_fragment_C(resident_c_ref));
         constexpr int kResidentStateRowBlocks = D / 16;
         ResidentStateAcc resident_state[kValueBlocksPerWarp][kResidentStateRowBlocks];
+        auto state_coords = resident_thr_mma.partition_C(
+            make_identity_tensor(make_shape(Int<16>{}, Int<16>{})));
+        const int64_t state_base = int64_t(seq_idx * H + head_idx) * D * D;
+        auto state_index = [&](int m, int bi, int element) {
+            const int key = m * 16 + int(get<0>(state_coords(element)));
+            const int value = v_idx * VD +
+                (resident_warp_id * kValueBlocksPerWarp + bi) * 16 +
+                int(get<1>(state_coords(element)));
+            return state_base + int64_t(value) * D + key;
+        };
         SeqlenT checkpoint_offset = 0;
         if constexpr (HasCheckpoint) {
             checkpoint_offset = checkpoint_offsets[seq_idx];
@@ -533,6 +508,23 @@ _flash_kda_fwd_recurrence(
         for (int m = 0; m < kResidentStateRowBlocks; ++m) {
             #pragma unroll
             for (int bi = 0; bi < kValueBlocksPerWarp; ++bi) {
+                if constexpr (StateFP32) {
+                    #pragma unroll
+                    for (int e = 0; e < size(resident_state[bi][m]); ++e) {
+                        if constexpr (HasStateIn) {
+                            resident_state[bi][m](e) =
+                                static_cast<float const*>(initial_state_raw)[state_index(m, bi, e)];
+                        } else {
+                            resident_state[bi][m](e) = 0.0f;
+                        }
+                        if constexpr (HasStateOut) {
+                            if (t_tiles == 0) {
+                                static_cast<float*>(final_state_raw)[state_index(m, bi, e)] =
+                                    resident_state[bi][m](e);
+                            }
+                        }
+                    }
+                } else {
                 Tensor state_block = local_tile(
                     resident_s_acc_T,
                     make_shape(Int<16>{}, Int<16>{}),
@@ -543,6 +535,7 @@ _flash_kda_fwd_recurrence(
                     resident_thr_load_c.partition_S(state_block),
                     resident_thr_load_c.retile_D(state_bf16));
                 cute::transform(state_bf16, resident_state[bi][m], ToF32{});
+                }
             }
         }
 
@@ -822,9 +815,26 @@ _flash_kda_fwd_recurrence(
                         }
                     }
 
+                    if constexpr (StateFP32 && (HasStateOut || HasCheckpoint)) {
+                        #pragma unroll
+                        for (int e = 0; e < size(state_fragment); ++e) {
+                            const int64_t index = state_index(m, bi, e);
+                            if constexpr (HasStateOut) {
+                                if (t + 1 == t_tiles) {
+                                    static_cast<float*>(final_state_raw)[index] = state_fragment(e);
+                                }
+                            }
+                            if constexpr (HasCheckpoint) {
+                                if (export_checkpoint) {
+                                    checkpoint_state_ptr[index] = state_fragment(e);
+                                }
+                            }
+                        }
+                    }
+
                     // The store warp observes the last output-stage commit only
                     // after these writes and the following shared-memory fence.
-                    if constexpr (HasStateOut && !kSpillAfterUpdate) {
+                    if constexpr (HasStateOut && !StateFP32 && !kSpillAfterUpdate) {
                         if (t + 1 == t_tiles || export_checkpoint) {
                             Tensor s_block = local_tile(
                                 s_acc_T,
@@ -833,7 +843,7 @@ _flash_kda_fwd_recurrence(
                             auto state_bf16 = narrow_state<ResidentStateFragment>(state_fragment);
                             copy(smem_tiled_store_C_T, smem_thr_store_C_T.retile_S(state_bf16), smem_thr_store_C_T.partition_D(s_block));
                         }
-                    } else if (export_checkpoint && !kSpillAfterUpdate) {
+                    } else if (!StateFP32 && export_checkpoint && !kSpillAfterUpdate) {
                         Tensor s_block = local_tile(
                             s_acc_T,
                             make_shape(Int<16>{}, Int<16>{}),
@@ -845,7 +855,7 @@ _flash_kda_fwd_recurrence(
                     }
                 }
             }
-            if (kSpillAfterUpdate && ((HasStateOut && t + 1 == t_tiles) || export_checkpoint)) {
+            if (!StateFP32 && kSpillAfterUpdate && ((HasStateOut && t + 1 == t_tiles) || export_checkpoint)) {
                 #pragma unroll
                 for (int m = 0; m < S_M_BLOCKS; ++m) {
                     #pragma unroll
@@ -860,7 +870,7 @@ _flash_kda_fwd_recurrence(
                 }
             }
             }
-            if constexpr (HasCheckpoint) {
+            if constexpr (HasCheckpoint && !StateFP32) {
                 if (export_checkpoint) {
                     cutlass::arch::NamedBarrier checkpoint_barrier(kComputeThreads, 0);
                     checkpoint_barrier.arrive_and_wait();
@@ -946,38 +956,6 @@ _flash_kda_fwd_recurrence(
         }
     }
 
-    if constexpr (HasStateOut && StateFP32) {
-        // FP32 state: all threads sync, convert bf16->fp32, then STORE warp does TMA
-        using FP32StateSmemLayout = typename Layouts::FP32StateSmemLayout;
-        using TMAFP32StateSmemLayout = typename Layouts::TMAFP32StateSmemLayout;
 
-        __syncthreads();  // all warps sync — pipeline smem now free
-
-        smem_cvt_bf16_to_fp32<StateSmemLayout, FP32StateSmemLayout, VD, D, NumThreads>(
-            shared_storage.state_acc.begin(),
-            reinterpret_cast<float*>(shared_storage.state_fp32_buf),
-            threadIdx.x);
-        cutlass::arch::fence_view_async_shared();  // generic-proxy writes -> visible to async proxy (TMA)
-        __syncthreads();  // conversion complete
-
-        if (warp_role == WarpRole::STORE && lane_predicate) {
-            Tensor g_final = tma_store_final_state.get_tma_tensor(make_shape(N * H, D, D));
-            auto state_off = g_final.layout()(seq_idx * H + head_idx, v_idx * VD, 0);
-            Tensor g_final_tile = make_tensor(g_final.data() + state_off,
-                make_layout(make_shape(Int<1>{}, Int<VD>{}, Int<D>{}), stride(g_final.layout())));
-            Tensor s_fp32 = make_tensor(
-                make_smem_ptr(reinterpret_cast<float*>(shared_storage.state_fp32_buf)),
-                TMAFP32StateSmemLayout{});
-
-            auto cta_tma_store_state = tma_store_final_state.get_slice(Int<0>{});
-            cute::copy(
-                tma_store_final_state,
-                cta_tma_store_state.partition_S(s_fp32),
-                cta_tma_store_state.partition_D(g_final_tile)
-            );
-            tma_store_arrive();
-            tma_store_wait<0>();
-        }
-    }
 
 }

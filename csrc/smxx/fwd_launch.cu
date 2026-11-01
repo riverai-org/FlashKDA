@@ -243,7 +243,8 @@ static void launch_kernels(
                     tma_load_initial_state_vsplit,
                     tma_store_final_state_vsplit,
                     tma_store_out_vsplit,
-                    out_ptr, checkpoint_state_ptr, checkpoint_offsets_ptr,
+                    out_ptr, initial_state_ptr, final_state_ptr,
+                    checkpoint_state_ptr, checkpoint_offsets_ptr,
                     T_total, H, N, cu_seqlens_ptr, total_tiles,
                     ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk);
                 return;
@@ -274,7 +275,8 @@ static void launch_kernels(
             tma_load_initial_state,
             tma_store_final_state,
             tma_store_out,
-            out_ptr, checkpoint_state_ptr, checkpoint_offsets_ptr,
+            out_ptr, initial_state_ptr, final_state_ptr,
+                    checkpoint_state_ptr, checkpoint_offsets_ptr,
             T_total, H, N, cu_seqlens_ptr, total_tiles,
             ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk
         );

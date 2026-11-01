@@ -276,3 +276,48 @@ def test_vsplit_varlen_exact(
     state_case: StateCase, cu_dtype: torch.dtype
 ) -> None:
     _assert_vsplit_exact(_make_varlen_problem(cu_dtype), state_case)
+
+
+@pytest.mark.parametrize("stop", [64, 128])
+def test_fp32_checkpoint_resume(stop: int) -> None:
+    problem = _make_problem(
+        batch=1, seq_len=129, cu_seqlens=None, num_sequences=1, seed=91
+    )
+    initial = torch.randn(1, H, D, D, device="cuda", dtype=torch.float32) * 0.01
+    workspace = torch.empty(
+        flash_kda.get_workspace_size(129, H, 1), device="cuda", dtype=torch.uint8
+    )
+
+    def run(begin, end, state, checkpoint=None):
+        values = [x[:, begin:end] for x in
+                  (problem.q, problem.k, problem.v, problem.g, problem.beta)]
+        out = torch.empty_like(values[0])
+        final = torch.empty_like(state)
+        cu = torch.tensor([0, end - begin], device="cuda", dtype=torch.int32)
+        offsets = (torch.tensor([stop], device="cuda", dtype=torch.int32)
+                   if checkpoint is not None else None)
+        torch.ops.flash_kda.fwd(
+            *values, problem.scale, out, workspace, problem.A_log,
+            problem.dt_bias, LOWER_BOUND, initial_state=state, final_state=final,
+            cu_seqlens=cu, checkpoint_state=checkpoint, checkpoint_offsets=offsets,
+        )
+        return out, final
+
+    checkpoint = torch.empty_like(initial)
+    whole, expected = run(0, 129, initial, checkpoint)
+    _, prefix = run(0, stop, initial)
+    torch.testing.assert_close(checkpoint, prefix, rtol=0, atol=0)
+    tail, resumed = run(stop, 129, checkpoint)
+    torch.testing.assert_close(tail, whole[:, stop:], rtol=0, atol=0)
+    torch.testing.assert_close(resumed, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_unaligned_one_token_beta() -> None:
+    problem = _make_problem(
+        batch=1, seq_len=1, cu_seqlens=None, num_sequences=1, seed=92
+    )
+    unaligned = torch.empty(H + 1, device="cuda", dtype=torch.bfloat16)[1:]
+    unaligned.copy_(problem.beta.flatten())
+    problem = dataclasses.replace(problem, beta=unaligned.view(1, 1, H))
+    assert problem.beta.data_ptr() % 16 != 0
+    _assert_vsplit_exact(problem, StateCase("unaligned_beta", True, True, torch.float32))

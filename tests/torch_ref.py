@@ -134,7 +134,7 @@ def torch_ref(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial
     initial_state/final_state can be:
       - None: no state (zero-init / skip store)
       - bf16 tensor: [N, H, D, D]
-      - fp32 tensor: [N, H, D, D] (converted to bf16 for compute, back to fp32 for output)
+      - fp32 tensor: [N, H, D, D] (preserved across recurrence boundaries)
     """
     assert q.dim() == 4, f"Expected 4D input [B, T, H, D], got {q.dim()}D"
     B = q.shape[0]
@@ -168,9 +168,6 @@ def torch_ref(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial
         scale = lower_bound * LOG2E
         g = scale * sigmoid_ext.sigmoid_tanh_fp32(a_log_exp * g)
 
-    state_fp32 = (initial_state is not None and initial_state.dtype == torch.float32) or \
-                 (final_state is not None and final_state.dtype == torch.float32)
-
     if cu_seqlens is None:
         T = q.shape[0]
         cu_seqlens = torch.tensor([0, T], dtype=torch.long, device=device)
@@ -178,9 +175,8 @@ def torch_ref(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial
     N = len(cu_seqlens) - 1
 
     if initial_state is not None:
-        # The kernel narrows an fp32 initial state to bf16 on load, then
-        # accumulates in fp32.
-        work_state = initial_state.to(torch.bfloat16).to(torch.float32)
+        # Only tensor-core operands narrow; persistent state remains FP32.
+        work_state = initial_state.float().clone()
     else:
         work_state = torch.zeros(N, H, D, D, dtype=torch.float32, device=device)
 
@@ -244,9 +240,4 @@ def torch_ref(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial
                 out[t0:t0 + actual_len, h] = _out[:actual_len]
 
     if final_state is not None:
-        # The kernel stores the state through its bf16 shared-memory tile.
-        final_bf16 = work_state.to(torch.bfloat16)
-        if state_fp32:
-            final_state.copy_(final_bf16.to(torch.float32))
-        else:
-            final_state.copy_(final_bf16)
+        final_state.copy_(work_state)

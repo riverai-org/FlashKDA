@@ -171,6 +171,11 @@ void fwd(
     Tensor beta_bht = torch::stable::transpose(beta, 1, 2);
     Tensor beta_hbt = torch::stable::transpose(beta_bht, 0, 1);
     Tensor beta_t = torch::stable::contiguous(beta_hbt);
+    // With a single token, contiguous() may keep an unaligned slice. TMA
+    // requires a 16-byte base even when the tensor has only one element.
+    if (reinterpret_cast<uintptr_t>(beta_t.const_data_ptr()) % 16 != 0) {
+        beta_t = torch::stable::clone(beta_t);
+    }
     auto beta_t_ptr = reinterpret_cast<cutlass::bfloat16_t const*>(beta_t.const_data_ptr());
 
     auto workspace_ptr = workspace.mutable_data_ptr();
