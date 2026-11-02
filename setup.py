@@ -4,7 +4,11 @@ from setuptools import setup
 from torch.utils.cpp_extension import CUDAExtension, BuildExtension, CUDA_HOME
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
-subprocess.run(["git", "submodule", "update", "--init", "cutlass"])
+if not os.path.isfile(os.path.join(this_dir, "cutlass", "include", "cutlass", "cutlass.h")):
+    raise RuntimeError(
+        "CUTLASS headers are missing. Run git submodule update --init --recursive "
+        "before building, or include the populated cutlass directory in the source archive."
+    )
 
 
 def is_flag_set(flag: str) -> bool:
